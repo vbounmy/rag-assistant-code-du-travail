@@ -26,4 +26,4 @@ Le prompt pousse le LLM à donner la règle générale accompagnée de réserves
 ### 5. Frontière du conseil juridique
 
 - Question factuelle (réponse directe dans le Code) → réponse avec citation d'article.
-- Question d'interprétation d'une situation personnelle → le système explique le cadre légal général mais ne tranche pas, et renvoie vers un professionnel (avocat, inspection du travail), avec l'avertissement juridique.
+- Question d'interprétation d'une situation personnelle → le système explique le cadre légal général mais ne tranche pas, et renvoie vers un professionnel (avocat, inspection du travail), avec l'avertissement juridique.s
