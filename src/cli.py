@@ -9,7 +9,7 @@ from sentence_transformers import SentenceTransformer
 from config import CHROMA_PERSIST_PATH, EMBEDDING_MODEL
 
 COLLECTION_NAME = "code_du_travail"
-SEUIL_CONFIANCE = 0.5
+SEUIL_CONFIANCE = 0.7
 STOP_WORDS = {
     "a", "au", "aux", "avec", "ce", "ces", "comme", "dans", "de", "des", "du", "elle", "en",
     "et", "est", "etre", "être", "for", "il", "je", "la", "le", "les", "leur", "mais", "mes", "notre",
