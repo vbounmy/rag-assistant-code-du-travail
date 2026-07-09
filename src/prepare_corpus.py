@@ -1,139 +1,137 @@
 import argparse
-import gzip
 import json
+import os
 import random
-import re
-import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import Any
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-ARTICLE_TAGS = {"article", "articletexte", "art", "articl"}
-SECTION_TAGS = {"section", "soussection", "soustion", "chapitre", "titre", "rubrique", "partie", "division", "book", "fascicule", "sels"}
-TITLE_TAGS = {"titre", "denomination", "libelle", "designation", "intitule", "label", "num"}
+import pandas as pd
 
-NAMESPACE_RE = re.compile(r"\{.*\}")
-CLEANUP_RE = re.compile(r"\s+")
-REFERENCE_RE = re.compile(r"\s*\[[0-9,\s]+\]")
-PAREN_RE = re.compile(r"\s*\([^)]*(?:voir|cf\.|cf|article|source)[^)]*\)", flags=re.I)
+from config import EMBEDDING_MODEL, ROOT_DIR, HF_TOKEN
+
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN
+
+from sentence_transformers import SentenceTransformer
 
 
 class LegiCorpusPreparer:
-    def __init__(self, data_dir: Path = ROOT_DIR / "data", output_path: Path = ROOT_DIR / "data" / "legi_corpus.jsonl", seed: int = 42):
+    def __init__(
+        self,
+        data_dir: Path = ROOT_DIR / "data",
+        output_path: Path = ROOT_DIR / "data" / "legi_corpus.jsonl",
+        embedding_model: str = EMBEDDING_MODEL,
+        batch_size: int = 32,
+        seed: int = 42,
+        device: str = "cpu",
+    ):
         self.data_dir = data_dir.resolve()
         self.output_path = output_path.resolve()
+        self.embedding_model_name = embedding_model
+        self.batch_size = batch_size
         self.seed = seed
+        self.device = device
 
     def prepare(self) -> None:
         random.seed(self.seed)
-        xml_files = self._collect_xml_files()
-        if not xml_files:
-            raise SystemExit(f"Aucun fichier XML trouvé dans {self.data_dir}. Placez les fichiers LEGI ici.")
+        parquet_files = self._collect_parquet_files()
+        if not parquet_files:
+            raise SystemExit(f"Aucun fichier Parquet trouvé dans {self.data_dir}. Placez les fichiers LEGI ici.")
 
-        print(f"{len(xml_files)} fichier(s) XML trouvé(s) dans {self.data_dir}.")
-        documents = [doc for path in xml_files for doc in self._parse_file(path)]
-        if not documents:
-            raise SystemExit("Aucune entrée extraite. Vérifiez la structure XML et adaptez le parser si nécessaire.")
+        print(f"{len(parquet_files)} fichier(s) Parquet trouvé(s) dans {self.data_dir}.")
+        rows: list[dict[str, Any]] = []
+        for path in parquet_files:
+            rows.extend(self._parse_parquet(path))
+
+        if not rows:
+            raise SystemExit("Aucune entrée extraite. Vérifiez le contenu du fichier Parquet.")
+
+        texts = [self._select_text(row) for row in rows]
+        embeddings = self._embed_texts(texts)
+
+        documents = []
+        for row, embedding in zip(rows, embeddings):
+            document = self._build_document(row, embedding)
+            documents.append(document)
 
         self._save_jsonl(documents)
         print(f"Corpus enregistré dans {self.output_path} ({len(documents)} documents).\n")
         self._display_samples(documents)
 
-    def _collect_xml_files(self) -> list[Path]:
-        files = sorted(self.data_dir.rglob("*.xml"))
-        files.extend(sorted(self.data_dir.rglob("*.xml.gz")))
-        return files
+    def _collect_parquet_files(self) -> list[Path]:
+        return sorted(self.data_dir.rglob("*.parquet"))
 
-    def _parse_file(self, path: Path) -> list[dict]:
-        try:
-            with self._open_xml(path) as stream:
-                tree = ET.parse(stream)
-        except ET.ParseError as exc:
-            print(f"WARN: impossible de parser {path}: {exc}")
-            return []
+    def _parse_parquet(self, path: Path) -> list[dict[str, Any]]:
+        print(f"Lecture de {path}...")
+        dataframe = pd.read_parquet(path)
+        rows = dataframe.to_dict(orient="records")
+        return [self._normalize_row(row, path) for row in rows]
 
-        root = tree.getroot()
-        parent_map = self._build_parent_map(root)
-        articles = [elem for elem in root.iter() if self._is_article_element(elem)]
+    def _normalize_row(self, row: dict[str, Any], path: Path) -> dict[str, Any]:
+        normalized = {}
+        for key, value in row.items():
+            if pd.isna(value):
+                normalized[key] = None
+            elif isinstance(value, (list, dict)):
+                normalized[key] = value
+            else:
+                normalized[key] = str(value) if not isinstance(value, (int, float, bool)) else value
+        normalized["__source_path__"] = str(path)
+        return normalized
 
-        documents = []
-        for article in articles:
-            article_number = self._extract_article_number(article) or "unknown"
-            title = self._find_first_subtext(article, TITLE_TAGS) or ""
-            raw_text = self._get_text(article)
-            cleaned_text = self._clean_text(raw_text)
-            section = self._find_section_labels(article, parent_map)
-            text = f"{title}. {cleaned_text}".strip() if title else cleaned_text
-            doc_id = f"{path.name}:{article_number}" if article_number != "unknown" else f"{path.name}:{len(documents)+1}"
-
-            documents.append({
-                "id": doc_id,
-                "article_number": article_number,
-                "title": title,
-                "text": text,
-                "section": section,
-                "source": path.name,
-                "source_path": str(path),
-            })
-
-        return documents
-
-    def _open_xml(self, path: Path):
-        return gzip.open(path, mode="rb") if path.suffix.lower() == ".gz" or path.name.lower().endswith(".xml.gz") else open(path, mode="rb")
-
-    @staticmethod
-    def _get_text(element: ET.Element) -> str:
-        return " ".join(text.strip() for text in element.itertext() if text and text.strip())
-
-    @staticmethod
-    def _clean_text(text: str) -> str:
-        text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
-        text = REFERENCE_RE.sub("", text)
-        text = PAREN_RE.sub("", text)
-        return CLEANUP_RE.sub(" ", text).strip()
-
-    @staticmethod
-    def _local_name(tag: str) -> str:
-        return NAMESPACE_RE.sub("", tag) if isinstance(tag, str) else ""
-
-    def _build_parent_map(self, root: ET.Element) -> dict[ET.Element, ET.Element]:
-        return {child: parent for parent in root.iter() for child in parent}
-
-    def _find_first_subtext(self, element: ET.Element, tag_names: set[str]) -> str | None:
-        for child in element:
-            if self._local_name(child.tag).lower() in tag_names:
-                value = self._get_text(child)
-                if value:
-                    return value
-        for child in element:
-            value = self._find_first_subtext(child, tag_names)
+    def _select_text(self, row: dict[str, Any]) -> str:
+        for column_name in ("chunk_text", "text", "full_text", "content"):
+            value = self._clean_text(row.get(column_name))
             if value:
                 return value
-        return None
+        return ""
 
-    def _find_section_labels(self, article: ET.Element, parent_map: dict[ET.Element, ET.Element]) -> str:
-        labels = []
-        current = parent_map.get(article)
-        while current is not None:
-            tag = self._local_name(current.tag).lower()
-            if tag in SECTION_TAGS:
-                title = self._find_first_subtext(current, TITLE_TAGS)
-                if title and title not in labels:
-                    labels.append(title)
-            current = parent_map.get(current)
-        return " > ".join(reversed(labels)) if labels else "inconnu"
+    def _clean_text(self, text: Any) -> str:
+        if text is None:
+            return ""
+        if isinstance(text, float) and pd.isna(text):
+            return ""
+        return str(text).replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
 
-    def _extract_article_number(self, article: ET.Element) -> str | None:
-        num = self._find_first_subtext(article, {"num", "numero", "article"})
-        if num:
-            return num.strip()
-        for attr in ("id", "xml:id"):
-            value = article.attrib.get(attr)
-            if value:
-                return value.strip()
-        return None
+    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        model = SentenceTransformer(self.embedding_model_name, device=self.device)
+        embeddings = model.encode(texts, batch_size=self.batch_size, show_progress_bar=True, convert_to_numpy=True)
+        return embeddings.tolist()
 
-    def _is_article_element(self, element: ET.Element) -> bool:
-        return self._local_name(element.tag).lower() in ARTICLE_TAGS
+    def _build_document(self, row: dict[str, Any], embedding: list[float]) -> dict[str, Any]:
+        title = self._clean_text(row.get("title") or row.get("full_title") or row.get("number"))
+        article_number = self._clean_text(row.get("number") or row.get("doc_id") or row.get("chunk_id") or "unknown")
+        section = self._clean_text(row.get("category") or row.get("nature") or row.get("ministry") or "inconnu")
+        text = self._select_text(row)
+        source_name = self._clean_text(row.get("doc_id") or row.get("title") or row.get("__source_path__"))
+        chunk_id = self._clean_text(row.get("chunk_id") or row.get("doc_id") or row.get("id"))
+
+        return {
+            "id": chunk_id or f"{article_number}:{len(embedding)}",
+            "article_number": article_number,
+            "title": title,
+            "text": text,
+            "section": section,
+            "source": source_name,
+            "source_path": self._clean_text(row.get("__source_path__")),
+            "metadata": {
+                "chunk_id": self._clean_text(row.get("chunk_id")),
+                "doc_id": self._clean_text(row.get("doc_id")),
+                "chunk_index": self._clean_text(row.get("chunk_index")),
+                "nature": self._clean_text(row.get("nature")),
+                "category": self._clean_text(row.get("category")),
+                "ministry": self._clean_text(row.get("ministry")),
+                "status": self._clean_text(row.get("status")),
+                "number": self._clean_text(row.get("number")),
+                "start_date": self._clean_text(row.get("start_date")),
+                "end_date": self._clean_text(row.get("end_date")),
+                "links": row.get("links"),
+            },
+            "embedding_model": self.embedding_model_name,
+            "embedding": embedding,
+        }
 
     def _save_jsonl(self, documents: list[dict]) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -156,12 +154,20 @@ class LegiCorpusPreparer:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prépare un corpus LEGI en JSONL pour la recherche vectorielle.")
-    parser.add_argument("--data-dir", type=Path, default=ROOT_DIR / "data", help="Répertoire contenant les fichiers XML LEGI.")
+    parser.add_argument("--data-dir", type=Path, default=ROOT_DIR / "data", help="Répertoire contenant les fichiers Parquet LEGI.")
     parser.add_argument("--output", type=Path, default=ROOT_DIR / "data" / "legi_corpus.jsonl", help="Fichier JSONL de sortie.")
+    parser.add_argument("--embedding-model", default=EMBEDDING_MODEL, help="Modèle d'embedding à utiliser.")
+    parser.add_argument("--batch-size", type=int, default=32, help="Taille de lot pour l'encodage.")
     parser.add_argument("--seed", type=int, default=42, help="Graine pour l'échantillonnage aléatoire.")
     args = parser.parse_args()
 
-    preparer = LegiCorpusPreparer(data_dir=args.data_dir, output_path=args.output, seed=args.seed)
+    preparer = LegiCorpusPreparer(
+        data_dir=args.data_dir,
+        output_path=args.output,
+        embedding_model=args.embedding_model,
+        batch_size=args.batch_size,
+        seed=args.seed,
+    )
     preparer.prepare()
 
 
