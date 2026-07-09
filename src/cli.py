@@ -1,11 +1,10 @@
 import sys
 from prompt import generate_answer
 
-# TODO : à remplacer par l'import de la vraie fonction de retrieval
-# de ta collègue une fois son Jalon 3 prêt, ex:
-# from retrieval import retrieve_chunks
+from retrieval_eval import retrieve_chunks
 
-SEUIL_CONFIANCE = 0.5  # à calibrer une fois le vrai retrieval branché
+
+SEUIL_CONFIANCE = 0.5  
 
 
 def retrieve_chunks_fake(question, top_k=3):
@@ -69,7 +68,8 @@ def main():
             print("Merci de saisir une question.")
             continue
 
-        # TODO : remplacer retrieve_chunks_fake par retrieve_chunks (vrai retrieval)
+        chunks = retrieve_chunks(question)
+
         chunks = retrieve_chunks_fake(question)
 
         if not chunks:
