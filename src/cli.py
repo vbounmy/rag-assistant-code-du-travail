@@ -5,17 +5,34 @@ from prompt import generate_answer
 # de ta collègue une fois son Jalon 3 prêt, ex:
 # from retrieval import retrieve_chunks
 
+SEUIL_CONFIANCE = 0.5  # à calibrer une fois le vrai retrieval branché
+
+
 def retrieve_chunks_fake(question, top_k=3):
     """
     Fonction temporaire, à supprimer une fois le vrai retrieval branché.
-    Retourne des chunks factices pour tester la CLI en isolé.
+    Retourne des chunks factices avec un score pour tester la CLI en isolé.
     """
     return [
         {
             "article": "L3141-3",
             "texte": "Le salarié a droit à un congé de deux jours et demi ouvrables par mois de travail effectif chez le même employeur.",
+            "score": 0.87,
         }
     ]
+
+
+def verifier_confiance(chunks):
+    """
+    chunks : liste de dicts, chacun devra contenir une clé 'score'
+    une fois le retrieval de ta collègue branché (score de similarité, 0 à 1,
+    plus haut = meilleure correspondance).
+    Retourne True si la confiance est suffisante, False sinon.
+    """
+    if not chunks:
+        return False
+    meilleur_score = max(chunk.get("score", 1.0) for chunk in chunks)
+    return meilleur_score >= SEUIL_CONFIANCE
 
 
 def afficher_reponse(reponse, chunks):
@@ -25,7 +42,13 @@ def afficher_reponse(reponse, chunks):
     print("\n" + "-" * 60)
     print("Articles source(s) utilisé(s) :")
     for chunk in chunks:
-        print(f"  - Article {chunk['article']}")
+        score = chunk.get("score")
+        if score is not None:
+            print(f"  - Article {chunk['article']} (confiance : {score:.2f})")
+        else:
+            print(f"  - Article {chunk['article']}")
+    if not verifier_confiance(chunks):
+        print("\n⚠️  Confiance faible : cette réponse pourrait être imprécise ou hors sujet.")
     print("=" * 60 + "\n")
 
 
