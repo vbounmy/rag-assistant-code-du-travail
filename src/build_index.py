@@ -9,7 +9,7 @@ import chromadb
 from config import CHROMA_PERSIST_PATH, EMBEDDING_MODEL, ROOT_DIR
 
 COLLECTION_NAME = "code_du_travail"
-CORPUS_PATH = ROOT_DIR / "data" / "legi_corpus.jsonl"
+CORPUS_PATH = ROOT_DIR / "data" / "legi_corpus_vigueur.jsonl"
 
 
 class ChromaIndexer:
