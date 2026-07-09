@@ -1,24 +1,119 @@
+import re
 import sys
+from collections import Counter
+
+import chromadb
 from prompt import generate_answer
+from sentence_transformers import SentenceTransformer
 
-from retrieval_eval import retrieve_chunks
+from config import CHROMA_PERSIST_PATH, EMBEDDING_MODEL
+
+COLLECTION_NAME = "code_du_travail"
+SEUIL_CONFIANCE = 0.5
+STOP_WORDS = {
+    "a", "au", "aux", "avec", "ce", "ces", "comme", "dans", "de", "des", "du", "elle", "en",
+    "et", "est", "etre", "être", "for", "il", "je", "la", "le", "les", "leur", "mais", "mes", "notre",
+    "nous", "on", "ou", "par", "pour", "qu", "que", "qui", "sa", "se", "ses", "sur", "ta",
+    "te", "tes", "un", "une", "vos", "votre", "vous", "y", "sont", "quelle", "quelles",
+    "quel", "quels", "combien", "comment", "pourquoi", "peut", "peuvent", "doit", "dans",
+    "cest", "c'est", "lequel", "laquelle", "lesquels", "lesquelles",
+}
+
+_MODEL: SentenceTransformer | None = None
 
 
-SEUIL_CONFIANCE = 0.5  
+def _get_model() -> SentenceTransformer:
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = SentenceTransformer(EMBEDDING_MODEL)
+    return _MODEL
 
 
-def retrieve_chunks_fake(question, top_k=3):
-    """
-    Fonction temporaire, à supprimer une fois le vrai retrieval branché.
-    Retourne des chunks factices avec un score pour tester la CLI en isolé.
-    """
-    return [
-        {
-            "article": "L3141-3",
-            "texte": "Le salarié a droit à un congé de deux jours et demi ouvrables par mois de travail effectif chez le même employeur.",
-            "score": 0.87,
-        }
-    ]
+def _tokeniser(texte: str) -> list[str]:
+    tokens = re.findall(r"[a-zA-ZÀ-ÿ]+(?:'[a-zA-ZÀ-ÿ]+)?", texte.lower())
+    return [token for token in tokens if len(token) > 1 and token not in STOP_WORDS]
+
+
+def _score_lexical(question: str, document: str) -> float:
+    q_tokens = Counter(_tokeniser(question))
+    d_tokens = Counter(_tokeniser(document))
+    if not q_tokens:
+        return 0.0
+    shared = sum(min(q_tokens[token], d_tokens[token]) for token in q_tokens if token in d_tokens)
+    return shared / max(1, len(q_tokens))
+
+
+def _enrichir_question(question: str) -> str:
+    q = question.lower()
+    expansions = []
+    if any(term in q for term in ["préavis", "preavis", "démission", "demission"]):
+        expansions.append("préavis démission")
+    if any(term in q for term in ["cdd", "durée déterminée", "duree determinee", "renouvel"]):
+        expansions.append("contrat à durée déterminée renouvellement")
+    if any(term in q for term in ["cdi", "durée indéterminée", "duree indeterminee"]):
+        expansions.append("contrat à durée indéterminée")
+    if any(term in q for term in ["congés", "conges"]):
+        expansions.append("congés payés")
+    if any(term in q for term in ["licenciement", "motif économique", "motif economique", "motif"]):
+        expansions.append("licenciement motif économique")
+    if "travail" in q and ("hebdomadaire" in q or "horaire" in q):
+        expansions.append("durée légale du travail")
+    if any(term in q for term in ["durée", "duree", "hebdomadaire", "mensuel", "mois"]):
+        expansions.append("durée légale")
+    if any(term in q for term in ["définition", "definition", "qu'est-ce", "quest-ce"]):
+        expansions.append("définition article")
+    return " ".join([question, *expansions])
+
+
+def _normalize_article_number(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def retrieve_chunks(question, top_k=3):
+    question = str(question or "").strip()
+    if not question:
+        return []
+
+    model = _get_model()
+    client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_PATH))
+    collection = client.get_collection(COLLECTION_NAME)
+
+    query = _enrichir_question(question)
+    embedding = model.encode(query, convert_to_numpy=True).tolist()
+    resultats = collection.query(
+        query_embeddings=[embedding],
+        n_results=min(top_k * 12, 60),
+        include=["documents", "metadatas", "distances"],
+    )
+
+    candidates: dict[str, dict[str, object]] = {}
+    for document, metadata, distance in zip(
+        resultats["documents"][0],
+        resultats["metadatas"][0],
+        resultats["distances"][0],
+    ):
+        article = _normalize_article_number((metadata or {}).get("numero_article"))
+        if not article:
+            continue
+        text = str(document or "")
+        lexical = _score_lexical(question, text) + _score_lexical(query, text)
+        vector = 1.0 / (1.0 + max(float(distance), 1e-9))
+        combined = 0.55 * vector + 0.45 * lexical
+        if "licenciement" in question.lower() and "motif économique" in query:
+            if "licenciement" in text or "motif économique" in text:
+                combined += 0.08
+        existing = candidates.get(article)
+        if existing is None or combined > existing["score"]:
+            candidates[article] = {
+                "article": article,
+                "texte": text,
+                "score": combined,
+            }
+
+    return sorted(candidates.values(), key=lambda item: item["score"], reverse=True)[:top_k]
+
 
 
 def verifier_confiance(chunks):
@@ -69,8 +164,6 @@ def main():
             continue
 
         chunks = retrieve_chunks(question)
-
-        chunks = retrieve_chunks_fake(question)
 
         if not chunks:
             print("\nJe ne trouve pas cette information dans ma base de connaissances.")
